@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# EgoVerse one-shot conditioning-policy SFT — 1-SECOND run config for the
+# `action_policy_egoverse_nano` experiment. 1s = 29 video frames (chunk_length
+# 28), the experiment default. Recipe knobs (optimizer/lr, action heads,
+# multi-domain, shared-grid packing) live in the registered experiment; this
+# file sets run-level scalars + 4-node parallelism.
+#
+# Env required:
+#   EGOVERSE_DATA_ROOT=/mnt/ddn/dataset                 # parent of egoverse/ + egoverse_eva/
+#   EGOVERSE_PAIRS_DIR=/mnt/ddn/dataset/egoverse_pairs_v7
+#   BASE_CHECKPOINT_PATH=<Cosmos3-Nano DCP dir>
+#   WAN_VAE_PATH=<Wan2.2_VAE.pth>
+#   IMAGINAIRE_OUTPUT_ROOT=/path/to/output_root
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_egoverse_nano"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_egoverse_1s_repro"
+wandb_mode   = "online"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+# 4 nodes x 8 GPU = 32 ranks. HSDP: shard the model 8-way within a node
+# (NVLink), replicate 4-way across nodes (8 * 4 = 32). shard=8 makes the moe_gen
+# optimizer state fit comfortably (1/8 per GPU). dp_shard * dp_replicate == world.
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 4
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+cycle_lengths = [10000]   # warm_up_steps are INCLUDED in this length
+warm_up_steps = [500]     # linear LR ramp 0 -> peak over first 500 iters (the
+                          # experiment default is 0 = no warmup → early instability)
+
+[trainer]
+max_iter     = 10000
+logging_iter = 50
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 2000
+
+# Paired samples are ~2x a single clip (demo + query). Batch is overridden at
+# launch (kube YAML `--` override): start ~16/rank, lower if OOM.

@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# EgoVerse one-shot conditioning-policy SFT — 5-SECOND run config for the
+# `action_policy_egoverse_nano` experiment. 5s = 149 video frames (≡1 mod 4),
+# chunk_length 148 (overridden via the kube YAML `--` arg). encode_exact_durations
+# is set to [149] here so the VAE encodes the full 5s clip.
+#
+# 5s is ~4.75x the latent tokens of 1s (latent_t 38 vs 8) for EACH of the two
+# vision items, so it is MUCH heavier: chunk_length=148 / encode_exact_durations=[149]
+# / small batch live in the dedicated `action_policy_egoverse_5s_nano` experiment
+# (so they can't silently fall back to 1s). Watch max_num_tokens_after_packing
+# (one 5s sample ≈ 24k vision tokens; default 45056 fits ~1 sample/pack).
+# Same env as the 1s repro.
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_egoverse_5s_nano"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_egoverse_5s_repro"
+wandb_mode   = "online"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+# 4 nodes x 8 GPU = 32 ranks. HSDP: shard 8-way within a node (NVLink),
+# replicate 4-way across nodes.
+# NOTE: the NCCL-init hang seen on some node sets is a HARDWARE issue (a bad GPU7
+# IB NIC/rail — cross-node channels 7<->23,15<->31 hang in ANY parallelism, incl.
+# pure FSDP), NOT a parallelism choice. Fix = exclude the bad node via nodeAffinity,
+# not by changing shard/replicate.
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 4
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+# encode_exact_durations=[149] + chunk_length=148 are in the 5s experiment.
+
+[scheduler]
+cycle_lengths = [50000]   # = max_iter; warm_up_steps are INCLUDED in this length
+warm_up_steps = [1000]    # linear LR ramp 0 -> peak over first 1000 iters (stabilizes
+                          # the early steps; the experiment default is 0 = no warmup)
+
+[trainer]
+max_iter     = 50000
+logging_iter = 50
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 10000

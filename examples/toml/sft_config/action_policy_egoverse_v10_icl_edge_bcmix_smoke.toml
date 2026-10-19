@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# EgoVerse v10 ICL mid-train + RoboMIND BC replay — Cosmos3-EDGE, stage 1.
+#
+# Same ICL recipe as action_policy_egoverse_v10_icl_edge, with two extra streams
+# so the gripper rows the public Edge base already trained do not decay while the
+# backbone spends 10K steps on human hands.
+#
+#   egoverse         ratio 90   domain 3 (57D)  + domain 12 for a 25% slice of
+#                               mimicdroid via the 57->20 projection
+#   robomind_franka  ratio  5   domain 8  (10D)  80 tasks / 1,610,770 frames
+#   robomind_agilex  ratio  5   domain 12 (20D)  32 tasks / 1,606,647 frames
+#
+# The two BC streams are 4.97% and 4.95% of the EgoVerse pool's 32,436,920 frames.
+# Both run mode="wam" — first frame in, video+actions jointly denoised out — the
+# same contract the RoboCasa post-train uses.
+#
+# Env required (beyond the base recipe):
+#   ROBOMIND_DATA_ROOT=/mnt/ddn/dataset      # parent of robomind_{franka,agilex}_3rgb
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_egoverse_v10_icl_edge_bcmix2"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_egoverse_v10_icl_edge_bcmix_smoke"
+wandb_mode   = "offline"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 2
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+cycle_lengths = [4]
+warm_up_steps = [2]
+
+[dataloader_train]
+# 2 GPUs, tiny batch — this run only asks whether the three streams load.
+max_samples_per_batch = 1
+
+[trainer]
+max_iter     = 4
+logging_iter = 1
+
+[checkpoint]
+load_path = "${oc.env:EDGE_LOAD_PATH}"
+save_iter = 1000000

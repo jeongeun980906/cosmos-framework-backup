@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# 2-GPU SMOKE for GR1 post-training (action_policy_gr1_posttrain_5s_nano), warm-started
+# from the EgoVerse 10k checkpoint (POSTTRAIN_LOAD_PATH). Validates the full loop
+# (fwd + flow-matching loss + bwd + optimizer.step) with **use_state=True** — the
+# state0-prepended (chunk+1) multi-segment action path that the 4-node run will use.
+# Drops "moe_gen" from the trained params so the FusedAdam state fits on 2 GPUs (the
+# generation expert is still LOADED + run in the forward, just not optimized here).
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_gr1_posttrain_5s_nano"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_gr1_posttrain_smoke"
+wandb_mode   = "disabled"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 2
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+# Drop "moe_gen" → optimize only the small generation/action heads so the optimizer
+# state fits on 2 GPUs (the forward still runs the full model, incl. the loaded moe_gen).
+keys_to_select = ["time_embedder", "vae2llm", "llm2vae", "action2llm", "llm2action", "action_modality_embed"]
+
+[dataloader_train]
+max_samples_per_batch = 2
+
+[scheduler]
+cycle_lengths = [3]
+warm_up_steps = [0]
+
+[trainer]
+max_iter     = 3
+logging_iter = 1
+
+[checkpoint]
+# EgoVerse 10k checkpoint dir — warm-start gen + action heads (experiment sets
+# keys_to_skip_loading=[]); fresh optimizer (load_training_state=False).
+load_path = "${oc.env:POSTTRAIN_LOAD_PATH}"
+save_iter = 100

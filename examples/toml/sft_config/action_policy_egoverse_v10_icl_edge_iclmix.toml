@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# EgoVerse v10 ICL mid-train + RoboMIND ICL replay — Cosmos3-EDGE, stage 1.
+#
+# bcmix with the two RoboMIND streams switched from BC to ICL, so EVERY rank in
+# the run trains the same contract: [demo, query], demo fully clean, query
+# generated. In bcmix 87.5% of ranks were ICL and 12.5% were BC, which mixed
+# "replay the gripper rows" with "train the no-demo pathway" — iclmix separates
+# them by holding the layout fixed across the whole run.
+#
+#   egoverse         ratio 14   domain 3 (57D)  + domain 12 for a 25% slice of
+#                               mimicdroid via the 57->20 projection
+#   robomind_franka  ratio  1   domain 8  (10D)  80 tasks / 1,610,770 frames
+#   robomind_agilex  ratio  1   domain 12 (20D)  32 tasks / 1,606,647 frames
+#
+# Ratios are unchanged from bcmix, deliberately: 14/1/1 divides into [28, 2, 2]
+# = 87.5 / 6.25 / 6.25 at 32 ranks, keeping the two replay streams equal. Only
+# the dataset factory differs, so iclmix-vs-bcmix reads as one variable.
+#
+# RoboMIND demo retrieval (get_action_robomind_icl_sft_dataset defaults):
+#   - same task (one LeRobot repo per task), always a DIFFERENT episode
+#   - 8 candidate episodes, best match kept; within the winner, one of the 5
+#     windows nearest in t0 EE pose + gripper + net displacement
+#   Measured on insert_marker: demos moving OPPOSITE to the query fall from
+#   50% (uniform draw) to 4.4%, with 64% inside 0.1 of the query's own phase.
+#
+# Cost vs bcmix: a RoboMIND sample carries two 17-frame vision items instead of
+# one — 10 latent frames against 5, still far under the EgoVerse pair's 46 — so
+# max_samples_per_batch stays at the recipe default.
+#
+# 3 streams -> world_size must be >= 3. This runs 4 nodes x 8 = 32 ranks
+# (shard 8 x replicate 4).
+#
+# Env required (beyond the base recipe):
+#   ROBOMIND_DATA_ROOT=/mnt/ddn/dataset      # parent of robomind_{franka,agilex}_3rgb
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_egoverse_v10_icl_edge_iclmix"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_egoverse_v10_icl_edge_iclmix"
+wandb_mode   = "online"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 4
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+# encode_exact_durations stays at the recipe's [89], matching bcmix. Adding 17
+# (the RoboMIND clip length) would skip the VAE's pad-to-chunk-boundary for those
+# clips, which is a speedup but also shifts the causal-conv chunk boundary and so
+# the latents themselves — a second difference from bcmix, in an arm whose whole
+# point is to differ in one. It is also not a TOML key: the schema owns vae_path
+# only, and the recipe sets durations in the experiment Python.
+
+[scheduler]
+cycle_lengths = [10000]
+warm_up_steps = [500]
+
+[trainer]
+max_iter     = 10000
+logging_iter = 50
+
+[checkpoint]
+load_path = "${oc.env:EDGE_LOAD_PATH}"
+save_iter = 1000

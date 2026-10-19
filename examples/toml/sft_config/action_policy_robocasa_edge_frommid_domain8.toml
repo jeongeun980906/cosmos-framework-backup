@@ -1,0 +1,97 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# RoboCasa 24-task action-policy SFT on Cosmos3-Edge — the "dom8" arm.
+#
+# Identical to action_policy_robocasa_edge_frommid.toml (the bcmix 8K arm) in
+# every respect, INCLUDING the EgoVerse warm start. The single difference lives
+# in the registered experiment: the dataset is built with
+# domain_name="robomind-franka", so the action heads index DomainAwareLinear
+# row 8 instead of row 5.
+#
+# Why row 8. action2llm/llm2action are nn.Embedding tables of per-domain weight
+# matrices, so a run only trains the rows it indexes. Row 5 (libero/robocasa) is
+# UNTRAINED in the public Cosmos3-Edge base — llm2action.bias[5] is exactly
+# 0.00000, still at its nn.init.zeros_ value. Row 8 (robomind-franka / droid) IS
+# trained there. Pointing RoboCasa at 8 therefore starts from fitted weights.
+#
+# Measured on the 400-step RoboCasa proxy (base = 1.000, negative t = better):
+#
+#   arm            step 300-400        step 2-50
+#   d8_base        0.917  t=-2.19        0.240      <- public base, NO EgoVerse
+#   d8_bcmix 1K    0.913  t=-2.40        0.327
+#   d8_bcmix 4K    0.957  t=-1.06        0.356
+#   d8_bcmix 8K    0.965  t=-1.00        0.347
+#
+# Note what that says. The strongest dom8 arm is d8_base, which never saw
+# EgoVerse — the win is routing, not warm start. Adding the EgoVerse start makes
+# it worse and does so consistently: d8_bcmix4000 - d8_base = +0.00856, t=+6.32
+# over steps 100+, with the early band degrading 0.240 -> 0.356.
+#
+# This arm carries the 8K start into a real 20K run so the routing effect can be
+# judged on success rate instead of a 400-step proxy. To isolate the routing win
+# by itself, point EGOVERSE_EDGE_LOAD_PATH at the PUBLIC base checkpoint instead
+# and rerun this same config — the proxy says that is the stronger arm.
+#
+# The action tensor stays 7-wide. domain_utils maps robomind-franka to dim 10,
+# but the dataset's raw_action_dim governs the tensor; the domain id only picks
+# which embedding row the heads read (same arrangement as the dom3 arm).
+#
+# *** EVAL MUST USE DOMAIN_NAME=robomind-franka ***
+# The eval client defaults to "robocasa" -> row 5, which this run never trains.
+# Querying that row returns garbage rather than erroring.
+#
+# Env required:
+#   ROBOCASA_ROOT=/mnt/ddn/dataset/RoboCasa-Cosmos-Policy/success_only
+#   EGOVERSE_EDGE_LOAD_PATH=<EgoVerse Edge mid DCP iter dir>   # bcmix 8K:
+#     /mnt/ddn/tmp/egoverse_v10_icl_edge_bcmix_4node/cosmos3_action/action_sft/\
+#       action_policy_egoverse_v10_icl_edge_bcmix/checkpoints/iter_000008000
+#   WAN_VAE_PATH=/mnt/ddn/ckpt/wan2.2/Wan2.2_VAE.pth
+#   IMAGINAIRE_OUTPUT_ROOT=/path/to/output_root
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_robocasa_edge_frommid_domain8"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_robocasa_edge_frommid_domain8"
+wandb_mode   = "online"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+# 3 nodes x 8 GPU: HSDP shards 8-way inside a node over NVLink and replicates
+# 3-way across nodes -> 24 ranks, global batch 16 x 24 = 384. For a single node
+# set replicate = 1. dp_shard * dp_replicate MUST equal world_size.
+#
+# These MUST live here, not on the CLI: `[model]` is a structured node, so a
+# trailing `-- model.parallelism.data_parallel_replicate_degree=3` dies with
+# `ConfigKeyError: Key 'parallelism' is not in struct` at rank 0 and takes the
+# whole job down at rendezvous.
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 3
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+# cycle_lengths INCLUDES warm_up_steps and MUST equal trainer.max_iter.
+# cycle < max_iter kills the run with a TypeError at the very end;
+# cycle > max_iter stops it at a still-high LR.
+cycle_lengths = [20000]
+warm_up_steps = [500]
+
+[trainer]
+max_iter     = 20000
+logging_iter = 50
+
+[checkpoint]
+load_path = "${oc.env:EGOVERSE_EDGE_LOAD_PATH}"
+save_iter = 5000

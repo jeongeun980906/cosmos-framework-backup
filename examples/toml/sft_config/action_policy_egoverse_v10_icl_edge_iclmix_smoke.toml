@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# iclmix smoke — 2 GPUs, 4 iterations. Asks one question: do the streams load,
+# pack and step together under the ICL layout?
+#
+# Uses the iclmix2 experiment (egoverse + robomind_franka only) because
+# RankPartitionedDataLoader assigns WHOLE RANKS and asserts
+# world_size >= len(datasets), so the 3-stream config needs >= 3 GPUs.
+#
+# Env required (beyond the base recipe):
+#   ROBOMIND_DATA_ROOT=/mnt/ddn/dataset      # parent of robomind_{franka,agilex}_3rgb
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_egoverse_v10_icl_edge_iclmix2"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_egoverse_v10_icl_edge_iclmix_smoke"
+wandb_mode   = "offline"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 2
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+cycle_lengths = [4]
+warm_up_steps = [2]
+
+[dataloader_train]
+# 2 GPUs, tiny batch — this run only asks whether the two streams load.
+max_samples_per_batch = 1
+
+[trainer]
+max_iter     = 4
+logging_iter = 1
+
+[checkpoint]
+load_path = "${oc.env:EDGE_LOAD_PATH}"
+save_iter = 1000000

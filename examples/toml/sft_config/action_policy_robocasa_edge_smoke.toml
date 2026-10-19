@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# RoboCasa Cosmos3-Edge SMOKE — 20 iters, 1 GPU, one task (PnPStoveToCounter),
+# batch 1, no checkpoint writes. Same code path as the full run, so a config /
+# dataloader / shape break surfaces in ~2 minutes instead of on a 3-node job.
+#
+#   ROBOCASA_ROOT=/mnt/ddn/dataset/RoboCasa-Cosmos-Policy/success_only \
+#   EDGE_LOAD_PATH=/mnt/ddn/ckpt/cosmos3_edge_dcp \
+#   WAN_VAE_PATH=/mnt/ddn/ckpt/wan2.2/Wan2.2_VAE.pth \
+#   IMAGINAIRE_OUTPUT_ROOT=/mnt/ddn/tmp/robocasa24_edge_smoke \
+#   python -m cosmos_framework.scripts.train \
+#       --sft-toml=examples/toml/sft_config/action_policy_robocasa_edge_smoke.toml
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_robocasa_edge_smoke"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_robocasa_edge_smoke"
+wandb_mode   = "disabled"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 1
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+cycle_lengths = [20]
+warm_up_steps = [0]
+
+[trainer]
+max_iter     = 20
+logging_iter = 1
+
+[checkpoint]
+load_path = "${oc.env:EDGE_LOAD_PATH}"
+save_iter = 1000000

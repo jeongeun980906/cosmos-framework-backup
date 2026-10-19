@@ -1,0 +1,91 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# RoboCasa 24-task SFT on Cosmos3-Edge — the "arm33" arm.
+#
+# What the overnight local search (9 x 400-step trials vs a base measured under
+# identical conditions) converged on. Two changes to the mid arm:
+#
+#   1. domain 3 with the action channels at Reef9 (action_channel_offset = 33)
+#   2. backbone (moe_gen) lr multiplier 3.0
+#
+# Why offset 33: EgoVerse trained DomainAwareLinear row 3 on the 57-D layout
+# head9|Leef9|Lhand15|Reef9|Rhand15. Channels 0..6 -- what a 7-D arm reads by
+# default -- are the HEAD block, which docs/action57_state57_convention.md §3d
+# says is the CONSTANT IDENT9 in every robot episode. Reef9 (33..41) is the right
+# end-effector body-frame delta: the same physical quantity RoboCasa sends. The
+# loss still covers exactly 7 dims (flow_matching slices the window [33:40]).
+#
+#   band            arm33+bb3   bb3 only   d3_ref   base
+#   early    2-50      0.1932     0.2621   0.4120    1.0
+#   mid     51-200     0.7932     0.8212   0.9700    1.0
+#   late   201-400     0.9469     0.9906   1.0500    1.0
+#
+# Caveat worth stating: 400 local steps is 2% of this 20K run, and on the cluster
+# base and mid converged to within +0.002 after ~4K steps. This recipe is proven
+# on the early phase, which is where the mid arm's damage happened -- not on the
+# endpoint. Judge it on eval.
+#
+# *** EVAL MUST USE --domain-name hand_pose AND --action-channel-offset 33 ***
+# Either alone reads a window this run never trained and returns plausible garbage
+# rather than erroring.
+#
+# Env required:
+#   ROBOCASA_ROOT=/mnt/ddn/dataset/RoboCasa-Cosmos-Policy/success_only
+#   EGOVERSE_EDGE_LOAD_PATH=/mnt/ddn/ckpt/c3edge_egoverse8k_reef9half
+#     (the mid checkpoint with domain 3's llm2action Reef9 columns scaled x0.5234;
+#      a DCP PARENT dir -- the loader appends /model)
+#   WAN_VAE_PATH=/mnt/ddn/ckpt/wan2.2/Wan2.2_VAE.pth
+#   IMAGINAIRE_OUTPUT_ROOT=/path/to/output_root
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_robocasa_edge_reef9half"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_robocasa_edge_reef9half"
+wandb_mode   = "online"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+# Set for the shipped 3-node jobs: HSDP shards the model 8-way inside a node over
+# NVLink and replicates 3-way across nodes -> 24 ranks, global batch
+# max_samples_per_batch(16) x 24 = 384. For a single node set replicate = 1
+# (global batch 128). dp_shard * dp_replicate MUST equal world_size.
+#
+# These MUST live here, not on the CLI: `[model]` is a structured node, so a
+# trailing `-- model.parallelism.data_parallel_replicate_degree=3` dies with
+# `ConfigKeyError: Key 'parallelism' is not in struct` at rank 0 and takes the whole
+# job down at rendezvous. (`trainer.*` / `dataloader_train.*` overrides DO work.)
+#
+# Measured: 5.0 s/iter at 16 samples/rank -> ~28 h for the 20K iters below.
+# (25/rank also fits — 7.9 s/iter, 43.1 GB — and at 3 nodes would match the
+# Cosmos-Policy arm exactly on iters, global batch and epochs; ~44 h.)
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 3
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+# Same invariant as the base arm: cycle_lengths INCLUDES warm_up_steps and MUST
+# equal trainer.max_iter. cycle < max_iter kills the run with a TypeError at the
+# very end; cycle > max_iter stops it at a still-high LR.
+cycle_lengths = [20000]
+warm_up_steps = [500]
+
+[trainer]
+max_iter     = 20000
+logging_iter = 50
+
+[checkpoint]
+load_path = "${oc.env:EGOVERSE_EDGE_LOAD_PATH}"
+save_iter = 5000

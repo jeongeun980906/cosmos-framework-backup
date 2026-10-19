@@ -1,0 +1,79 @@
+# LIBERO 7D action-policy post-training (Cosmos3-Nano)
+
+Post-trains the public `nvidia/Cosmos3-Nano` base into a LIBERO manipulation
+policy, jointly on the four eval suites (`libero_spatial`, `libero_object`,
+`libero_goal`, `libero_10`). Mirrors the DROID/PushT recipes; closed-loop eval is
+in [`action_policy_eval.md`](./action_policy_eval.md).
+
+## What the recipe does
+
+* **Data**: `nvidia/LIBERO_LeRobot_v3` (LeRobot v3.0, 20 fps). Single agent-view
+  camera (`observation.images.image`, 256×256). The four suites are mixed at the
+  dataloader level with frame-count-proportional ratios → one policy for all four.
+* **Action**: 7D delta end-effector `[dpos(3), daxang(3), gripper]`. The stored
+  `action` column is already the per-step controller command (OpenVLA-OFT
+  convention), so no pose-delta reconstruction is needed. Min-max normalized to
+  [−1, 1] via a shared stats file (see below); padded to `max_action_dim=64` and
+  masked via `raw_action_dim=7`.
+* **Sequence**: `chunk_length=16` → 17-frame video window (`encode_exact_durations=[17]`,
+  ≡1 mod 4 for the 4× temporal-compression tokenizer).
+* **Trained params**: generation + action heads (action heads init fresh from the
+  base), lr 2e-4 FusedAdam, LambdaLinear schedule — identical stack to DROID/PushT.
+
+## Inputs
+
+1. **Dataset** — download the four suites:
+   ```bash
+   hf download nvidia/LIBERO_LeRobot_v3 --repo-type dataset \
+     --revision ddc1edeb6e51e2b7d4d2ba7a1433daaecd37aa64 \
+     --include "libero_spatial/*" "libero_object/*" "libero_goal/*" "libero_10/*" \
+     --local-dir /path/to/LIBERO_LeRobot_v3
+   ```
+2. **Normalization stats** — committed at
+   `cosmos_framework/data/vfm/action/datasets/libero_lerobot_normalization.json`
+   (combined min/max over the four suites). Regenerate with:
+   ```bash
+   python tools/gen_libero_normalization.py --dataset-root /path/to/LIBERO_LeRobot_v3
+   ```
+   The **same file** feeds the eval server (`--action-stats-path`) so train-time
+   normalization and eval-time denormalization are identical.
+3. **Base checkpoint** — `nvidia/Cosmos3-Nano` converted to DCP (`convert_model_to_dcp`).
+4. **Wan2.2 VAE** — `Wan2.2_VAE.pth`.
+
+## Launch
+
+```bash
+LIBERO_ROOT=/path/to/LIBERO_LeRobot_v3 \
+BASE_CHECKPOINT_PATH=<Cosmos3-Nano DCP dir> \
+WAN_VAE_PATH=<Wan2.2_VAE.pth> \
+NPROC_PER_NODE=8 \
+bash examples/launch_sft_action_policy_libero.sh
+```
+
+Drives `examples/toml/sft_config/action_policy_libero_repro.toml`
+(`action_policy_libero_nano` experiment, 40k iters, res256, 128 samples/rank).
+
+### Smoke test (2 GPUs, 10 iters)
+
+Nano-8B does not fit on one GPU; use ≥2-way FSDP shard. The smoke also drops the
+batch and disables EMA to fit memory:
+
+```bash
+NPROC_PER_NODE=2 \
+TOML_FILE="examples/toml/sft_config/action_policy_libero_smoke.toml" \
+TAIL_OVERRIDES=(dataloader_train.max_samples_per_batch=1 model.config.ema.enabled=false) \
+LIBERO_ROOT=/path/to/LIBERO_LeRobot_v3 \
+BASE_CHECKPOINT_PATH=<dir> WAN_VAE_PATH=<vae> \
+bash examples/launch_sft_action_policy_libero.sh
+```
+
+## Notes / knobs
+
+* **FFmpeg for torchcodec**: the av1 videos need FFmpeg libs on `LD_LIBRARY_PATH`
+  (e.g. `export LD_LIBRARY_PATH=/path/to/ffmpeg/lib:$LD_LIBRARY_PATH`).
+* **Wrist camera**: the dataset also ships `observation.images.wrist_image`, left
+  unused — the OSS LIBERO eval server is single-image, so training stays
+  single-view for train/eval consistency. Adding a concat dual-view would require
+  a matching multi-image eval path.
+* **Batch/memory**: 128 samples/rank suits H200/H100; lower via
+  `--opts dataloader_train.max_samples_per_batch=32` on smaller GPUs.

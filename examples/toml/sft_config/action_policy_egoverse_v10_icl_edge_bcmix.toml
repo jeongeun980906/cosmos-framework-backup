@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# EgoVerse v10 ICL mid-train + RoboMIND BC replay — Cosmos3-EDGE, stage 1.
+#
+# Same ICL recipe as action_policy_egoverse_v10_icl_edge, with two extra streams
+# so the gripper rows the public Edge base already trained do not decay while the
+# backbone spends 10K steps on human hands.
+#
+#   egoverse         ratio 14   domain 3 (57D)  + domain 12 for a 25% slice of
+#                               mimicdroid via the 57->20 projection
+#   robomind_franka  ratio  1   domain 8  (10D)  80 tasks / 1,610,770 frames
+#   robomind_agilex  ratio  1   domain 12 (20D)  32 tasks / 1,606,647 frames
+#
+# On disk the two BC sets are 4.97% and 4.95% of the EgoVerse pool's 32,436,920
+# frames. The ratios are 14/1/1 rather than 90/5/5 because RankPartitionedDataLoader
+# assigns WHOLE RANKS: one rank of 32 is 3.125%, so 5% is not representable and
+# 90/5/5 resolves to [29, 2, 1] — 6.25% franka against 3.125% agilex. 14/1/1 divides
+# exactly into [28, 2, 2] = 87.5 / 6.25 / 6.25, keeping the two BC streams equal at a
+# 12.5% combined share.
+#
+# 3 streams -> world_size must be >= 3. This runs 4 nodes x 8 = 32 ranks
+# (shard 8 x replicate 4).
+#
+# Both BC streams run mode="wam" — first frame in, video+actions jointly denoised
+# out — the same contract the RoboCasa post-train uses.
+#
+# Env required (beyond the base recipe):
+#   ROBOMIND_DATA_ROOT=/mnt/ddn/dataset      # parent of robomind_{franka,agilex}_3rgb
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_egoverse_v10_icl_edge_bcmix"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_egoverse_v10_icl_edge_bcmix"
+wandb_mode   = "online"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 4
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+cycle_lengths = [10000]
+warm_up_steps = [500]
+
+[trainer]
+max_iter     = 10000
+logging_iter = 50
+
+[checkpoint]
+load_path = "${oc.env:EDGE_LOAD_PATH}"
+save_iter = 1000

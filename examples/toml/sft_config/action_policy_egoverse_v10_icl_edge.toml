@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# EgoVerse v10 (3s) ICL SMID (abs next-state57 chunk) on Cosmos3-EDGE — stage 1.
+# pipeline. Cross-embodiment retrieval pairs (human 30Hz + mimicdroid 20Hz),
+# delta action57, speed conditioning. EDGE_LOAD_PATH = Cosmos3-Edge base DCP.
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_egoverse_v10_icl_edge"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_egoverse_v10_icl_edge"
+wandb_mode   = "online"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 4
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+cycle_lengths = [10000]
+warm_up_steps = [500]
+
+[trainer]
+max_iter     = 10000
+logging_iter = 50
+
+[checkpoint]
+load_path = "${oc.env:EDGE_LOAD_PATH}"
+save_iter = 1000

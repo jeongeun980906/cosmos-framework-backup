@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rm -rf /mnt/ddn/tmp/cosmos_egoverse_5s)",
+      "Bash(echo \"exit=$?\")",
+      "Read(//mnt/ddn/tmp/cosmos_egoverse_5s/**)",
+      "Read(//mnt/ddn/ckpt/cosmos3_nano_dcp/**)",
+      "Read(//mnt/ddn/dataset/egoverse_pairs_v7_noeva/**)",
+      "Read(//mnt/ddn/dataset/egoverse_pairs_v8/**)",
+      "Bash(/mnt/ddn/cosmos-framework/.venv/bin/python -c ' *)",
+      "Read(//mnt/ddn/dataset/**)",
+      "Bash(cd *)",
+      "Bash(/mnt/ddn/cosmos-framework/.venv/bin/python *)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"import json; d=json.load\\(open\\('cosmos_framework/data/vfm/action/datasets/egoverse_speed_stats.json'\\)\\); print\\(json.dumps\\(d,indent=1\\)\\)\")",
+      "Bash(git -C /mnt/ddn/cosmos-framework fetch --all)",
+      "Bash(git -C /mnt/ddn/cosmos-framework log --oneline HEAD..origin/main)"
+    ]
+  }
+}

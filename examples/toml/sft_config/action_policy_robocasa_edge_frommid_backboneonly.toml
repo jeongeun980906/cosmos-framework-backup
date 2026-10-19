@@ -1,0 +1,73 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# RoboCasa 24-task action-policy SFT on Cosmos3-Edge, warm-started from OUR
+# EgoVerse-trained Edge model instead of the public base — the "mid" arm.
+#
+# Everything except the load path matches action_policy_robocasa_edge.toml (the
+# "base" arm), so the pair isolates ONE variable: what the weights started from.
+# The registered experiment sets keys_to_skip_loading=[] so generation AND action
+# heads come from the mid checkpoint; load_training_state stays False, so this is a
+# fresh 20K schedule off those weights, not a resume of the EgoVerse run.
+#
+# Env required:
+#   ROBOCASA_ROOT=/mnt/ddn/dataset/RoboCasa-Cosmos-Policy/success_only
+#   EGOVERSE_EDGEHEAD_LOAD_PATH=<EgoVerse Edge mid DCP dir>   # e.g. the v10 ICL 8K:
+#     /mnt/ddn/tmp/egoverse_v10_icl_edge_4node/cosmos3_action/action_sft/\
+#       action_policy_egoverse_v10_icl_edge/checkpoints/iter_000008000
+#     (this one IS the iter dir — unlike the base arm's EDGE_LOAD_PATH, which is a
+#      parent the loader appends /model to; both end up reading <path>/model)
+#   WAN_VAE_PATH=/mnt/ddn/ckpt/wan2.2/Wan2.2_VAE.pth
+#   IMAGINAIRE_OUTPUT_ROOT=/path/to/output_root
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_robocasa_edge_frommid_backboneonly"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_robocasa_edge_frommid_backboneonly"
+wandb_mode   = "online"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+# Set for the shipped 3-node jobs: HSDP shards the model 8-way inside a node over
+# NVLink and replicates 3-way across nodes -> 24 ranks, global batch
+# max_samples_per_batch(16) x 24 = 384. For a single node set replicate = 1
+# (global batch 128). dp_shard * dp_replicate MUST equal world_size.
+#
+# These MUST live here, not on the CLI: `[model]` is a structured node, so a
+# trailing `-- model.parallelism.data_parallel_replicate_degree=3` dies with
+# `ConfigKeyError: Key 'parallelism' is not in struct` at rank 0 and takes the whole
+# job down at rendezvous. (`trainer.*` / `dataloader_train.*` overrides DO work.)
+#
+# Measured: 5.0 s/iter at 16 samples/rank -> ~28 h for the 20K iters below.
+# (25/rank also fits — 7.9 s/iter, 43.1 GB — and at 3 nodes would match the
+# Cosmos-Policy arm exactly on iters, global batch and epochs; ~44 h.)
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 3
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+# Same invariant as the base arm: cycle_lengths INCLUDES warm_up_steps and MUST
+# equal trainer.max_iter. cycle < max_iter kills the run with a TypeError at the
+# very end; cycle > max_iter stops it at a still-high LR.
+cycle_lengths = [20000]
+warm_up_steps = [500]
+
+[trainer]
+max_iter     = 20000
+logging_iter = 50
+
+[checkpoint]
+load_path = "${oc.env:EGOVERSE_EDGEHEAD_LOAD_PATH}"
+save_iter = 5000

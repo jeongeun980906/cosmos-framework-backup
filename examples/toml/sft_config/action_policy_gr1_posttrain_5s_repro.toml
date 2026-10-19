@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# GR1 POST-TRAINING (5s) — second-stage fine-tuning for the
+# `action_policy_gr1_posttrain_5s_nano` experiment. Continues from the
+# EgoVerse-trained 5s checkpoint and adapts to the GR1 humanoid (GR1 query →
+# SinkEnvForPlay play demo, both 20 Hz / action57 / hand_pose).
+#
+# Action chunk = 32 steps → 33 frames (= 1 + 4*8) @20 Hz ≈ 1.65 s per item
+# (chunk_length=32 / fps=20 / encode_exact_durations=[33] in the experiment).
+# These clips are MUCH lighter than the EgoVerse 5s run (latent_t 9 vs 38), so
+# max_samples_per_batch can go a lot higher than 5 if memory holds.
+#
+# IMPORTANT: POSTTRAIN_LOAD_PATH must point at an EgoVerse 5s *checkpoint dir*
+# (e.g. .../action_policy_egoverse_5s_repro/checkpoints/iter_000050000), NOT the
+# Cosmos3-Nano base — the experiment loads the trained generation + action heads
+# (keys_to_skip_loading=[]), so the policy warm-starts instead of re-initializing.
+# GR1_PAIRS_DIR defaults to /mnt/ddn/dataset/egoverse_pairs_gr1.
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_gr1_posttrain_5s_nano"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_gr1_posttrain_5s_repro"
+wandb_mode   = "online"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+# 4 nodes x 8 GPU = 32 ranks. HSDP: shard 8-way within a node, replicate 4-way.
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 4
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+# encode_exact_durations=[97] + chunk_length=148 are in the post-training experiment.
+
+[scheduler]
+cycle_lengths = [10000]   # = max_iter; warm_up_steps are INCLUDED in this length
+warm_up_steps = [200]     # short LR ramp (we resume already-good weights)
+
+[trainer]
+max_iter     = 10000
+logging_iter = 50
+
+[checkpoint]
+# EgoVerse-trained 5s checkpoint dir (the post-training warm-start), NOT the base.
+load_path = "${oc.env:POSTTRAIN_LOAD_PATH}"
+save_iter = 2000

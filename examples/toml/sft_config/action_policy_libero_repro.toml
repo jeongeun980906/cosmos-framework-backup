@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# LIBERO 7D action-policy SFT — run config for the `action_policy_libero_nano`
+# experiment. Recipe knobs (optimizer/lr, scheduler, grad_clip, count-based
+# batch, action-head skip-on-load, 4-suite dataset mix) live in the registered
+# experiment; this file only sets run-level scalars.
+#
+# Env required:
+#   LIBERO_ROOT=/path/to/LIBERO_LeRobot_v3   # parent dir holding the suite dirs
+#                                            # (libero_spatial/object/goal/10)
+#   BASE_CHECKPOINT_PATH=<Cosmos3-Nano DCP dir>   # convert_model_to_dcp output
+#   WAN_VAE_PATH=<Wan2.2_VAE.pth>
+#   IMAGINAIRE_OUTPUT_ROOT=/path/to/output_root   # persist checkpoints
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_libero_nano"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_libero_repro"
+wandb_mode   = "online"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+# 3 nodes x 8 GPU = 24 ranks. HSDP: shard the model 8-way within a node
+# (NVLink), replicate 3-way across nodes (8 * 3 = 24). For a single 8-GPU node
+# use shard=8, replicate=1. dp_shard * dp_replicate must equal world_size.
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 3
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+cycle_lengths = [10000]   # = max_iter (full LR decay -> model settles, less oscillation)
+
+[trainer]
+max_iter     = 10000
+logging_iter = 50
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 2000
+
+# LIBERO frames are 256p (~1:1), so the 128/rank count-based batch from the
+# experiment is fine on H200/H100. On smaller GPUs, lower it at launch:
+#   --opts dataloader_train.max_samples_per_batch=32

@@ -1,0 +1,48 @@
+# 5s training smoke for the EgoVerse conditioning policy on v7 pairs.
+# Tiny: 2-GPU FSDP shard, batch 1, a couple iters -- verifies the v7 data path
+# (windows/pairs_v7 -> reader -> paired transform -> packing -> model forward/loss)
+# at the full 5s window (chunk_length 148 / encode_exact_durations [149]).
+# Env: EGOVERSE_DATA_ROOT, EGOVERSE_PAIRS_DIR (default v7), BASE_CHECKPOINT_PATH, WAN_VAE_PATH.
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_egoverse_5s_nano"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_egoverse_5s_smoke"
+wandb_mode   = "disabled"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 2
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+# Drop "moe_gen"/"moe_und" from trained params (train only the small heads) so the
+# FusedAdam fp32 moment buffers fit on 2 GPUs at 5s -- validates the full LOOP
+# (fwd+bwd+optimizer.step) end-to-end on v7 data, not a real run.
+keys_to_select = ["time_embedder", "vae2llm", "llm2vae", "action2llm", "llm2action", "action_modality_embed"]
+
+[dataloader_train]
+max_samples_per_batch = 1   # 5s is heavy; 1 paired sample (demo+query) per step
+
+[scheduler]
+cycle_lengths = [3]
+warm_up_steps = [1]
+
+[trainer]
+max_iter     = 3
+logging_iter = 1
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 100

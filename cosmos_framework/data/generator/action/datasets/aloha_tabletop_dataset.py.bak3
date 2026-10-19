@@ -1,0 +1,257 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+"""Tabletop-Sim ALOHA bimanual dataset (20D absolute end-effector, HDF5-backed).
+
+Exists to give the RoboCasa 400-step probe a SECOND target with a different action
+width. Every warm-start conclusion so far rests on one 7-DOF benchmark routed through
+one untrained head row (domain 5); a 20D bimanual benchmark routed through a different
+untrained row (16) says whether those conclusions are about the backbone or about
+RoboCasa specifically.
+
+Layout. ``actions/ee_6d_pos`` is ``[T, 20]`` = per arm ``[pos(3), rot6d(6), grip(1)]``,
+left then right -- the same channel contract row 16 already carries for the YAM/eva
+embodiments, and the same one RoboMIND's dual-arm sets use at row 12.
+
+Row 16 is untrained in every checkpoint under comparison: ``llm2action.bias[16]`` is
+identically 0 in the public Edge base, in the ICL mid, and in the BC-replay mid, so all
+three start post-training from the same random head and the probe measures the backbone
+alone. That is the same property that makes row 5 the right choice for RoboCasa.
+
+Poses here are ABSOLUTE, not frame-to-frame deltas (positions sit at 0.18-0.64 m). That
+differs from the RoboCasa recipe but is identical across the three arms being compared,
+which is what the comparison requires. It also means the quantile widths are healthy
+(the narrowest channel spans ~1.0), so this reader needs none of the tail-clipping the
+AgileX delta-rot6d channels required.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import h5py
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+from cosmos_framework.data.generator.action.action_normalization import load_action_stats, normalize_action
+from cosmos_framework.data.generator.action.domain_utils import get_action_dim, get_domain_id
+
+_ACTION_KEY = "actions/ee_6d_pos"
+_STATE_KEY = "observations/states/ee_6d_pos"
+_LANG_KEY = "observations/states/language_instruction"
+# Scene view on top, the two wrists side by side underneath. ``back`` is dropped on purpose
+# -- it is the most redundant of the four views and a fourth row only inflates the canvas.
+#
+# The layout matters for cost, not just framing. The source resolutions differ:
+#   front 480x640, wrist_left 240x320, wrist_right 240x320
+# The first version matched every view to the WIDEST one, which upscaled both wrists 2x to
+# 480x640 and stacked all three vertically -> 1440x640. That quadruples each wrist's pixel
+# count while adding no information, and it showed up directly in the bill: 44,928 vision
+# tokens and 6.8 s/iter on 3 nodes, against RoboCasa's 21,168 tokens and 3.62 s/iter.
+#
+# Tiling the wrists in a row instead keeps every source pixel at its native scale and needs
+# no interpolation at all:
+#   front            480x640
+#   wristL | wristR  240x640   (two 240x320 side by side)
+#   ------------------------
+#   canvas           720x640    <- exactly half the old area, ~2x fewer vision tokens
+#
+# Only the interpolated pixels are gone; nothing real is discarded. Dropping the front view
+# to 240x320 as well would quarter the area, but that throws away actual scene detail.
+DEFAULT_CAMERAS: tuple[str, ...] = (
+    "observations/images/front",
+    "observations/images/wrist_left",
+    "observations/images/wrist_right",
+)
+# The caption tells the VLM where to look, so it has to track the layout above.
+CAPTION_PREFIX = (
+    "Top: front third-person camera. Bottom-left: left wrist camera. "
+    "Bottom-right: right wrist camera. Task: "
+)
+
+
+class _Episode:
+    __slots__ = ("path", "task", "num_steps")
+
+    def __init__(self, path: str, task: str, num_steps: int) -> None:
+        self.path, self.task, self.num_steps = path, task, num_steps
+
+
+class AlohaTabletopDataset(Dataset):
+    """Sliding-window reader over ``tabletop-simulation-hdf5/<task>/episode_*.hdf5``."""
+
+    def __init__(
+        self,
+        root: str,
+        fps: float = 20.0,
+        chunk_length: int = 32,
+        mode: str = "wam",
+        cameras: tuple[str, ...] | list[str] = DEFAULT_CAMERAS,
+        viewpoint: str = "third_person_view",
+        action_normalization: str | None = "minmax",
+        normalization_path: str | None = None,
+        task_split: list[str] | tuple[str, ...] | None = None,
+        pad_tail: bool = True,
+        sample_stride: int = 1,
+        domain_name: str = "aloha-tabletop",
+        index_cache_path: str | None = None,
+        use_state: bool = True,
+    ) -> None:
+        super().__init__()
+        self._root = Path(root)
+        self._fps = float(fps)
+        self._chunk_length = int(chunk_length)
+        self._mode = str(mode)
+        self._cameras = tuple(cameras)
+        self._viewpoint = str(viewpoint)
+        self._action_normalization = action_normalization
+        self._pad_tail = bool(pad_tail)
+        self._sample_stride = max(1, int(sample_stride))
+        self._domain_name = str(domain_name)
+        self._use_state = bool(use_state)
+        self._domain_id = get_domain_id(self._domain_name)
+        self._action_dim = get_action_dim(self._domain_name)
+        self._norm_path = normalization_path or str(
+            Path(__file__).parent.parent / "normalizer_stats" / "aloha_tabletop_stats.json"
+        )
+        self._norm_stats: dict[str, torch.Tensor] | None = None
+        self._handles: dict[str, h5py.File] = {}
+
+        keep = set(task_split) if task_split else None
+        eps: list[_Episode] = []
+        for task_dir in sorted(p for p in self._root.iterdir() if p.is_dir()):
+            if keep is not None and task_dir.name not in keep:
+                continue
+            for f in sorted(task_dir.glob("episode_*.hdf5")):
+                with h5py.File(f, "r") as h:
+                    n = int(h[_ACTION_KEY].shape[0])
+                eps.append(_Episode(str(f), task_dir.name, n))
+        if not eps:
+            raise ValueError(f"No episodes under {root} (task_split={task_split}).")
+        self._episodes = eps
+
+        # One window per start frame. ``pad_tail`` keeps the windows that run off the end
+        # (edge-padded), which is where task completion and gripper release live.
+        span = self._chunk_length + 1
+        counts = [
+            max(1, (e.num_steps + self._sample_stride - 1) // self._sample_stride)
+            if self._pad_tail
+            else max(0, (e.num_steps - span) // self._sample_stride + 1)
+            for e in eps
+        ]
+        self._win_counts = counts
+        self._win_cum = np.cumsum(counts)
+        self._length = int(self._win_cum[-1])
+
+    def __len__(self) -> int:
+        return self._length
+
+    def get_shuffle_blocks(self) -> list[tuple[int, int]]:
+        """``(start, length)`` per episode over the flat window index.
+
+        ``ActionIterableShuffleDataset`` shuffles these blocks and streams windows
+        sequentially inside each one, which keeps the HDF5 reads sequential -- a window
+        is ~30 MB of raw frames here, so random access across episodes would dominate.
+        """
+        starts = np.concatenate([[0], self._win_cum[:-1]]).astype(np.int64)
+        return [(int(st), int(n)) for st, n in zip(starts, self._win_counts) if n > 0]
+
+    @property
+    def action_dim(self) -> int:
+        return self._action_dim
+
+    def _h5(self, path: str) -> h5py.File:
+        # Worker-local handle cache: reopening a file per window dominates the read.
+        h = self._handles.get(path)
+        if h is None:
+            h = self._handles[path] = h5py.File(path, "r")
+        return h
+
+    def _load_norm_stats(self) -> dict[str, torch.Tensor]:
+        if self._norm_stats is None:
+            self._norm_stats = {
+                k: torch.from_numpy(v).float() for k, v in load_action_stats(self._norm_path).items()
+            }
+        return self._norm_stats
+
+    def _locate(self, idx: int) -> tuple[_Episode, int]:
+        ep_i = int(np.searchsorted(self._win_cum, idx, side="right"))
+        prev = int(self._win_cum[ep_i - 1]) if ep_i > 0 else 0
+        return self._episodes[ep_i], (idx - prev) * self._sample_stride
+
+    @staticmethod
+    def _read_span(dset: h5py.Dataset, t0: int, length: int, num_steps: int) -> np.ndarray:
+        hi = min(t0 + length, num_steps)
+        arr = np.asarray(dset[t0:hi])
+        missing = length - (hi - t0)
+        if missing > 0:
+            arr = np.concatenate([arr, np.repeat(arr[-1:], missing, axis=0)], axis=0)
+        return arr
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        ep, t0 = self._locate(int(idx) % self._length)
+        h = self._h5(ep.path)
+        window = self._chunk_length + 1
+
+        views = []
+        for cam in self._cameras:
+            v = self._read_span(h[cam], t0, window, ep.num_steps)  # (T, H, W, 3)
+            views.append(v)
+        # Scene view on top, the remaining views tiled in a row beneath it (see the layout
+        # note by DEFAULT_CAMERAS). The wrists are exactly half the scene view's width, so
+        # two of them fill the row and nothing needs resampling.
+        scene, rest = views[0], views[1:]
+        row = np.concatenate(rest, axis=2) if rest else None  # axis 2 = width
+        if row is not None and row.shape[2] != scene.shape[2]:
+            # Fallback for a non-default camera set whose row does not line up with the
+            # scene width. Resample the ROW, not the scene, so the scene stays native.
+            t = torch.from_numpy(np.ascontiguousarray(row)).permute(0, 3, 1, 2).float()
+            scale = scene.shape[2] / row.shape[2]
+            t = torch.nn.functional.interpolate(
+                t,
+                size=(max(1, int(round(row.shape[1] * scale))), scene.shape[2]),
+                mode="bilinear",
+                align_corners=False,
+            )
+            row = t.clamp(0, 255).to(torch.uint8).permute(0, 2, 3, 1).numpy()
+        video_thwc = scene if row is None else np.concatenate([scene, row], axis=1)
+        video = torch.from_numpy(np.ascontiguousarray(video_thwc)).permute(3, 0, 1, 2)  # (C,T,H,W) uint8
+
+        action = torch.from_numpy(
+            self._read_span(h[_ACTION_KEY], t0, self._chunk_length, ep.num_steps).astype(np.float32)
+        )
+        if self._action_normalization is not None:
+            action = normalize_action(action, self._action_normalization, self._load_norm_stats())
+
+        if self._use_state:
+            # 현재 절대 proprio 를 action[0] 으로 앞에 붙인다. 액션 길이가 chunk+1 이 되면
+            # build_sequence_plan_from_mode 가 condition_frame_indexes_action=[0] 을 자동으로
+            # 세워 그 행을 '노이즈 없는 조건'으로 다룬다 -- RoboCasa/DROID 와 같은 경로다.
+            #
+            # RoboCasa 는 액션이 delta 이고 state 는 절대값이라 robocasa_state 라는 별도
+            # 통계 블록이 필요했지만, ALOHA 는 actions/ee_6d_pos 와
+            # observations/states/ee_6d_pos 가 **같은 절대 EE 포즈 공간**(20D)이므로
+            # 액션과 동일한 통계를 그대로 쓴다.
+            state = torch.from_numpy(
+                np.asarray(h[_STATE_KEY][min(t0, ep.num_steps - 1)], dtype=np.float32)
+            )
+            if self._action_normalization is not None:
+                state = normalize_action(state, self._action_normalization, self._load_norm_stats())
+            action = torch.cat([state.unsqueeze(0), action], dim=0)  # (chunk+1, 20)
+
+        lang = h[_LANG_KEY][min(t0, ep.num_steps - 1)]
+        if isinstance(lang, bytes):
+            lang = lang.decode("utf-8")
+        task = str(lang) if lang else ep.task.replace("_", " ")
+
+        return {
+            "ai_caption": CAPTION_PREFIX + task,
+            "video": video,
+            "action": action,
+            "conditioning_fps": torch.tensor(self._fps, dtype=torch.long),
+            "mode": self._mode,
+            "domain_id": torch.tensor(self._domain_id, dtype=torch.long),
+            "viewpoint": self._viewpoint,
+            "idle_frames": torch.tensor(0, dtype=torch.long),
+        }

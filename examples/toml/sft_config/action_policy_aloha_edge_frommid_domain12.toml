@@ -1,0 +1,92 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# RoboCasa 24-task action-policy SFT on Cosmos3-Edge, warm-started from OUR
+# EgoVerse-trained Edge model instead of the public base — the "mid" arm.
+#
+# Everything except the load path matches action_policy_robocasa_edge.toml (the
+# "base" arm), so the pair isolates ONE variable: what the weights started from.
+# The registered experiment sets keys_to_skip_loading=[] so generation AND action
+# heads come from the mid checkpoint; load_training_state stays False, so this is a
+# fresh 20K schedule off those weights, not a resume of the EgoVerse run.
+#
+# Env required:
+#   ALOHA_ROOT=/mnt/ddn/dataset/tabletop-simulation-hdf5
+#   EGOVERSE_EDGE_LOAD_PATH=<EgoVerse Edge mid DCP dir>   # e.g. the v10 ICL 8K:
+#     /mnt/ddn/tmp/egoverse_v10_icl_edge_4node/cosmos3_action/action_sft/\
+#       action_policy_egoverse_v10_icl_edge/checkpoints/iter_000008000
+#     (this one IS the iter dir — unlike the base arm's EDGE_LOAD_PATH, which is a
+#      parent the loader appends /model to; both end up reading <path>/model)
+#   WAN_VAE_PATH=/mnt/ddn/ckpt/wan2.2/Wan2.2_VAE.pth
+#   IMAGINAIRE_OUTPUT_ROOT=/path/to/output_root
+# ============================================================================
+
+#
+# ALOHA — EgoVerse warm start + row 12 라우팅. 2x2 의 네 번째 칸.
+#   base + row16 (기본)      cosmos-aloha-c3edge-base-3node.yaml
+#   base + row12             cosmos-aloha-c3edge-base-dom12-3node.yaml
+#   ICL  + row16             cosmos-aloha-c3edge-icl8k-3node.yaml
+#   ICL  + row12             이 파일
+# 네 칸을 다 돌려야 "warm start"와 "라우팅"의 기여가 20K 실측으로 분리된다.
+#
+# 400-step 프록시 (step>100 paired t, 음수 = base(row16) 보다 좋음):
+#   base(row12)    -11.73        bcmix8K(row12)  -7.91
+#   bcmix8K(row16)  +1.44
+# row 16 은 공개 Edge base 에서 미학습이다(bias 정확히 0.0, fc 는 한 번도 인덱싱되지
+# 않은 row 0 과 소수점까지 동일 = weight decay 만). row 12 는 20D dual-arm 으로
+# 차원도 팔 개수도 맞고 학습돼 있다.
+#
+# *** EVAL MUST USE DOMAIN_NAME=robomind-agilex-dual ***
+# 기본값 aloha-tabletop(row 16)로 조회하면 이 런이 학습하지 않은 행을 읽어 에러 없이
+# 그럴듯한 쓰레기가 나온다.
+#
+[job]
+task         = "vfm"
+experiment   = "action_policy_aloha_edge_frommid_domain12"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_aloha_edge_frommid_domain12"
+wandb_mode   = "online"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+# Set for the shipped 3-node jobs: HSDP shards the model 8-way inside a node over
+# NVLink and replicates 3-way across nodes -> 24 ranks, global batch
+# max_samples_per_batch(16) x 24 = 384. For a single node set replicate = 1
+# (global batch 128). dp_shard * dp_replicate MUST equal world_size.
+#
+# These MUST live here, not on the CLI: `[model]` is a structured node, so a
+# trailing `-- model.parallelism.data_parallel_replicate_degree=3` dies with
+# `ConfigKeyError: Key 'parallelism' is not in struct` at rank 0 and takes the whole
+# job down at rendezvous. (`trainer.*` / `dataloader_train.*` overrides DO work.)
+#
+# Measured: 5.0 s/iter at 16 samples/rank -> ~28 h for the 20K iters below.
+# (25/rank also fits — 7.9 s/iter, 43.1 GB — and at 3 nodes would match the
+# Cosmos-Policy arm exactly on iters, global batch and epochs; ~44 h.)
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 3
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+# Same invariant as the base arm: cycle_lengths INCLUDES warm_up_steps and MUST
+# equal trainer.max_iter. cycle < max_iter kills the run with a TypeError at the
+# very end; cycle > max_iter stops it at a still-high LR.
+cycle_lengths = [8000]
+warm_up_steps = [500]
+
+[trainer]
+max_iter     = 8000
+logging_iter = 50
+
+[checkpoint]
+load_path = "${oc.env:EGOVERSE_EDGE_LOAD_PATH}"
+save_iter = 2000

@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# GR1 POST-TRAINING on 2x-SPEED play demos only (action_policy_gr1_posttrain_2x_nano).
+# One of two paired runs (1x / 2x) trained SEPARATELY for comparison. Warm-starts
+# from the EgoVerse 10k checkpoint. Demo pool = egoverse_pairs_gr1_2x (built by
+# `tools/build_gr1_posttrain_pairs.py --speeds 2x`). Leave GR1_PAIRS_DIR UNSET so
+# the 2x experiment's default pairs dir applies (or set it explicitly to the 2x dir).
+#
+# POSTTRAIN_LOAD_PATH must point at the EgoVerse 5s checkpoint dir (iter_000010000).
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_gr1_posttrain_2x_nano"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_gr1_posttrain_2x_repro"
+wandb_mode   = "online"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 4
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+cycle_lengths = [10000]
+warm_up_steps = [200]
+
+[trainer]
+max_iter     = 10000
+logging_iter = 50
+
+[checkpoint]
+load_path = "${oc.env:POSTTRAIN_LOAD_PATH}"
+save_iter = 2000

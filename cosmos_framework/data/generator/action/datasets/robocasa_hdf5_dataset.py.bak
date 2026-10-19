@@ -1,0 +1,444 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+"""RoboCasa (24-task kitchen) HDF5 dataset for Cosmos3 action-policy post-training.
+
+Reads the ``nvidia/RoboCasa-Cosmos-Policy`` release **in place** — the same
+``success_only/`` HDF5 tree the Cosmos-Policy RoboCasa runs train on
+(``cosmos_policy/datasets/robocasa_dataset.py``) — so a Cosmos3 run and a
+Cosmos-Policy run see byte-identical frames and action targets. No LeRobot
+conversion: the frames are uncompressed contiguous ``uint8`` inside the HDF5
+(re-encoding 135 GB to video would cost hours and buy nothing).
+
+Layout of one file (``<group>/<Task>/<date>/demo_gentex_im128_randcams.hdf5``)::
+
+    data/demo_N                     attrs: task_description
+      actions        (T, 12)        [:7] = [dpos(3), daxang(3), gripper] delta-EE
+                                    command; [7:] is the mobile base, unused (same
+                                    slice Cosmos-Policy takes).
+      robot_states   (T, 9)         [gripper(2), ee_pos(3), ee_quat(4)] — unused here
+      obs/robot0_agentview_left_rgb   (T, 224, 224, 3) uint8
+      obs/robot0_agentview_right_rgb  (T, 224, 224, 3) uint8
+      obs/robot0_eye_in_hand_rgb      (T, 224, 224, 3) uint8   (wrist)
+      obs/ee_pos     (T, 3)         absolute EE position
+      obs/ee_ori     (T, 3)         absolute EE orientation (axis-angle)
+      obs/gripper_states (T, 2)     the two finger joints
+
+This mirrors :class:`~cosmos_framework.data.generator.action.datasets.libero_lerobot_delta_dataset.LIBEROLeRobotDataset`
+(the 7D-delta LIBERO reader) — same action space, same ``use_state`` framing, same
+multi-view spatial concat — with an HDF5 backend and three cameras:
+
+  * **7D delta-EE action** ``[dpos(3), daxang(3), gripper]`` via
+    ``build_action_spec(Pos(dim=3), Rot("axisangle"), Gripper())``. The stored
+    ``actions[:, :7]`` column is already the command the RoboCasa OSC controller
+    consumes, so no pose-delta reconstruction is needed.
+  * **min-max normalization to ``[-1, 1]``** from a committed stats JSON
+    (``robocasa_hdf5_normalization.json``, written by
+    ``tools/gen_robocasa_normalization.py``). Its ``min``/``max`` are copied
+    verbatim from the release's ``dataset_statistics.json``, so the action target
+    is on the exact same scale as the Cosmos-Policy runs. The SAME file is passed
+    to the eval server via ``--action-stats-path`` so train-time normalization and
+    eval-time denormalization are identical.
+  * ``use_state=True`` (default): the current absolute proprio
+    ``[ee_pos(3), ee_ori(3), gripper_states[0]]`` — the same 7 channels as the
+    action, dropping the duplicated second finger exactly like the LIBERO reader —
+    is normalized with its OWN min/max (``"robocasa_state"``; the absolute kitchen
+    pose range reaches x≈6.2 m, far outside the delta range, so the delta stats
+    would clamp it away) and prepended as ``action[0]``. The action tensor is then
+    ``(chunk+1, 7)`` and the transform marks row 0 as clean conditioning
+    (``condition_frame_indexes_action=[0]``, Case B in ``transforms.py``).
+  * **Three cameras, vertically concatenated** into one frame (left agent-view on
+    top, right agent-view in the middle, wrist on the bottom). Cosmos3 takes a
+    single input video, so multi-view is spatial concat — the DROID/LIBERO
+    ``concat_view`` pattern, three-high as in the EgoVerse ``eva`` rig.
+
+Window contract (identical to the LIBERO delta reader): the decoded window is
+``chunk_length + 1`` frames ``[t0 .. t0+chunk]``; the ``chunk`` supervised action
+rows are ``actions[t0 : t0+chunk]`` — the commands that carry frame ``t0`` to
+frame ``t0+chunk`` under the robomimic ``act[t] -> obs[t+1]`` convention Cosmos-
+Policy also assumes.
+"""
+
+from __future__ import annotations
+
+import json
+import random
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Literal
+
+import h5py
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+from cosmos_framework.data.generator.action.action_normalization import load_action_stats, normalize_action
+from cosmos_framework.data.generator.action.action_spec import Gripper, Pos, Rot, build_action_spec
+from cosmos_framework.data.generator.action.domain_utils import get_domain_id
+from cosmos_framework.data.generator.action.pose_utils import compute_idle_frames
+from cosmos_framework.utils import log
+
+Viewpoint = Literal["third_person_view"]
+
+# Cameras, top-to-bottom in the concatenated frame. Cosmos-Policy feeds the same
+# three views (two third-person + wrist); keep this order stable — the eval client
+# stacks the live observation the same way.
+DEFAULT_CAMERAS: tuple[str, ...] = (
+    "robot0_agentview_left_rgb",
+    "robot0_agentview_right_rgb",
+    "robot0_eye_in_hand_rgb",
+)
+_JPEG_SUFFIX = "_jpeg"  # some shards store JPEG bytes instead of raw uint8
+
+_ACTION_DIM = 7  # [dpos(3), daxang(3), gripper]; actions[:, 7:] is the mobile base
+_STATE_DIM = 7  # [ee_pos(3), ee_ori(3), gripper_states[0]]
+
+_MODE_CHOICES = ("forward_dynamics", "inverse_dynamics", "wam")
+_NORM_METHODS = ("minmax", "meanstd", "quantile")
+_NORMALIZER_PATH = Path(__file__).parent / "robocasa_hdf5_normalization.json"
+_ACTION_STATS_KEY = "robocasa"
+_STATE_STATS_KEY = "robocasa_state"
+
+# Public: the eval client (``scripts/eval_robocasa_client.py``) must send the SAME
+# prefix, or the policy sees a prompt distribution it never trained on.
+CAPTION_PREFIX = "Top: left third-person camera. Middle: right third-person camera. Bottom: wrist camera. Task: "
+
+
+@dataclass(frozen=True)
+class _Episode:
+    """One demonstration: where it lives, how long it is, what it is."""
+
+    path: str
+    demo: str
+    num_steps: int
+    task: str
+
+
+@lru_cache(maxsize=64)
+def _open_h5(path: str) -> h5py.File:
+    """Cache HDF5 handles per worker process (opening is not free).
+
+    Populated lazily inside each DataLoader worker — never in ``__init__``, so no
+    handle is ever inherited across a fork (h5py handles are not fork-safe).
+    """
+    return h5py.File(path, "r", swmr=False)
+
+
+def _decode_jpeg_rows(rows: np.ndarray) -> np.ndarray:
+    """``(n,)`` array of JPEG byte blobs -> ``(n, H, W, 3)`` uint8."""
+    import io
+
+    from PIL import Image
+
+    return np.stack([np.asarray(Image.open(io.BytesIO(bytes(r))).convert("RGB")) for r in rows], axis=0)
+
+
+class RoboCasaHDF5Dataset(Dataset):
+    """RoboCasa 7D delta-EE action dataset (three views, HDF5-backed).
+
+    Args:
+        root: ``RoboCasa-Cosmos-Policy/success_only`` (the dir holding the
+            ``kitchen_*`` task groups). Scanned recursively for ``*.hdf5``.
+        fps: Control rate (RoboCasa is 20 Hz). Metadata for the prompt /
+            ``conditioning_fps``; frames are read by index, not timestamp.
+        chunk_length: Number of commanded action steps per sample. The decoded
+            window is ``chunk_length + 1`` frames.
+        mode: ``"wam"`` (default) trains the policy task — predict the action
+            chunk + future video from the conditioning frame. ``"joint"`` samples
+            one of forward/inverse-dynamics/wam per item.
+        cameras: Obs keys to stack vertically, top to bottom.
+        action_normalization: ``"minmax"`` (default), ``"meanstd"``, ``"quantile"``
+            or ``None``.
+        normalization_path: Override the stats JSON path.
+        use_state: Prepend the absolute proprio row as ``action[0]``
+            -> ``(chunk+1, 7)``.
+        task_split: Keep only these task names (the ``<Task>`` dir component,
+            e.g. ``["PnPStoveToCounter"]``). ``None`` = all 24.
+        pad_tail: Also emit windows that run past the episode end, edge-padding
+            the last frame/action. Keeps the terminal behaviour (task completion,
+            gripper release) in the training distribution — Cosmos-Policy pads the
+            same way. ``False`` drops those windows.
+        index_cache_path: Optional JSON to cache the episode scan. Written on
+            first build; reused when it matches ``root``/``task_split``.
+        domain_name: Embodiment key used ONLY to pick the ``DomainAwareLinear``
+            row (``action2llm``/``llm2action`` are ``nn.Embedding`` tables of
+            per-domain weight matrices). Defaults to ``"robocasa"`` -> id 5, which
+            shares LIBERO's row. Override to warm-start the head from a row some
+            other run actually trained, e.g. ``"hand_pose"`` (id 3) for the
+            EgoVerse arms. The action spec, ``raw_action_dim`` (7) and the
+            normalization block are NOT affected — only which weight row is
+            indexed. Note the channels then carry a different meaning than the row
+            was trained for (EgoVerse's 57D layout is
+            ``head9|Labs9|Lhand15|Rabs9|Rhand15`` with ``abs9=[pos,R0,R1]``, so
+            ch0-6 are head pose, not delta-EE + gripper).
+    """
+
+    def __init__(
+        self,
+        root: str,
+        fps: float = 20.0,
+        chunk_length: int = 32,
+        mode: str = "wam",
+        cameras: tuple[str, ...] | list[str] = DEFAULT_CAMERAS,
+        viewpoint: Viewpoint = "third_person_view",
+        action_normalization: str | None = "minmax",
+        normalization_path: str | None = None,
+        use_state: bool = True,
+        task_split: list[str] | tuple[str, ...] | None = None,
+        pad_tail: bool = True,
+        sample_stride: int = 1,
+        index_cache_path: str | None = None,
+        domain_name: str = "robocasa",
+    ) -> None:
+        super().__init__()
+        if viewpoint != "third_person_view":
+            raise NotImplementedError("RoboCasa dataset only supports the third_person_view concat stack.")
+        if action_normalization is not None and action_normalization not in _NORM_METHODS:
+            raise ValueError(f"action_normalization must be one of {_NORM_METHODS} or None.")
+        if int(sample_stride) < 1:
+            raise ValueError(f"sample_stride must be >= 1, got {sample_stride}")
+
+        self._root = Path(root)
+        self._fps = float(fps)
+        self._chunk_length = int(chunk_length)
+        self._mode = mode
+        self._cameras = tuple(cameras)
+        self._viewpoint = viewpoint
+        self._action_normalization = action_normalization
+        self._normalization_path = Path(normalization_path) if normalization_path else _NORMALIZER_PATH
+        self._use_state = bool(use_state)
+        self._pad_tail = bool(pad_tail)
+        self._sample_stride = int(sample_stride)
+        self._task_split = tuple(task_split) if task_split else None
+        self._domain_name = str(domain_name)
+        self._domain_id = get_domain_id(self._domain_name)
+        self._norm_stats: dict[str, torch.Tensor] | None = None
+        self._state_stats: dict[str, torch.Tensor] | None = None
+
+        self._episodes = self._build_index(index_cache_path)
+        if not self._episodes:
+            raise FileNotFoundError(f"No RoboCasa demos found under {self._root} (task_split={self._task_split}).")
+
+        # Flat window index: ``_win_cum[i]`` = number of windows in episodes 0..i.
+        counts = np.asarray([self._episode_window_count(ep) for ep in self._episodes], dtype=np.int64)
+        self._win_cum = np.cumsum(counts).astype(np.int64)
+        self._win_counts = counts
+        log.info(
+            f"Loaded RoboCasa dataset root={self._root} episodes={len(self._episodes)} "
+            f"windows={int(self._win_cum[-1])} chunk={self._chunk_length} cams={len(self._cameras)} "
+            f"use_state={self._use_state} pad_tail={self._pad_tail}"
+        )
+
+    # ------------------------------------------------------------------ index
+
+    def _build_index(self, cache_path: str | None) -> list[_Episode]:
+        signature = {
+            "root": str(self._root.resolve()),
+            "task_split": list(self._task_split) if self._task_split else None,
+        }
+        cache = Path(cache_path) if cache_path else None
+        if cache is not None and cache.is_file():
+            try:
+                blob = json.loads(cache.read_text())
+                if blob.get("signature") == signature:
+                    return [_Episode(**e) for e in blob["episodes"]]
+                log.warning(f"RoboCasa index cache {cache} has a stale signature — rescanning.")
+            except Exception as e:  # noqa: BLE001 — a corrupt cache must never be fatal
+                log.warning(f"RoboCasa index cache {cache} unreadable ({type(e).__name__}) — rescanning.")
+
+        episodes: list[_Episode] = []
+        for path in sorted(self._root.rglob("*.hdf5")):
+            # <root>/<group>/<Task>/<date>/demo_*.hdf5 — the task name is 3 levels up.
+            task_dir = path.parent.parent.name
+            if self._task_split is not None and task_dir not in self._task_split:
+                continue
+            with h5py.File(path, "r") as f:
+                data = f["data"]
+                for demo in sorted(data.keys(), key=lambda k: int(k.split("_")[-1])):
+                    grp = data[demo]
+                    num_steps = int(grp["actions"].shape[0])
+                    task = str(grp.attrs.get("task_description", task_dir))
+                    episodes.append(_Episode(str(path), demo, num_steps, task))
+        if cache is not None:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps({"signature": signature, "episodes": [e.__dict__ for e in episodes]}))
+        return episodes
+
+    def _episode_window_count(self, ep: _Episode) -> int:
+        """Number of start indices in one episode.
+
+        Without ``pad_tail`` a window must fit entirely: ``t0 + chunk <= T-1``.
+        With it, any ``t0`` up to ``T-2`` is allowed (the overhang is edge-padded),
+        so the episode tail stays in the training distribution.
+        """
+        span = (ep.num_steps - 1) if self._pad_tail else (ep.num_steps - 1 - self._chunk_length)
+        if span <= 0:
+            return 0
+        return (span + self._sample_stride - 1) // self._sample_stride
+
+    # ------------------------------------------------- properties / metadata
+
+    @property
+    def fps(self) -> float:
+        return self._fps
+
+    @property
+    def chunk_length(self) -> int:
+        return self._chunk_length
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    @mode.setter
+    def mode(self, value: str) -> None:
+        self._mode = value
+
+    @property
+    def domain_id(self) -> int:
+        return self._domain_id
+
+    @property
+    def action_dim(self) -> int:
+        return _ACTION_DIM
+
+    def _action_spec(self):
+        return build_action_spec(Pos(dim=3), Rot("axisangle"), Gripper())
+
+    @property
+    def action_names(self) -> list[str]:
+        return self._action_spec().names
+
+    def _choose_mode(self) -> str:
+        return random.choice(_MODE_CHOICES) if self._mode == "joint" else self._mode
+
+    def __len__(self) -> int:
+        return int(self._win_cum[-1]) if self._win_cum.size else 0
+
+    def get_shuffle_blocks(self) -> list[tuple[int, int]]:
+        """``(start, length)`` per episode over the flat window index.
+
+        ``ActionIterableShuffleDataset`` shuffles these blocks and streams windows
+        sequentially within each, which keeps the HDF5 reads sequential.
+        """
+        starts = np.concatenate([[0], self._win_cum[:-1]]).astype(np.int64)
+        return [(int(s), int(n)) for s, n in zip(starts, self._win_counts) if n > 0]
+
+    # ---------------------------------------------------------------- reading
+
+    def _locate(self, idx: int) -> tuple[_Episode, int]:
+        """Flat window index -> (episode, start frame)."""
+        ep_i = int(np.searchsorted(self._win_cum, idx, side="right"))
+        prev = int(self._win_cum[ep_i - 1]) if ep_i > 0 else 0
+        return self._episodes[ep_i], (idx - prev) * self._sample_stride
+
+    def _read_span(self, dset: h5py.Dataset, t0: int, length: int, num_steps: int) -> np.ndarray:
+        """Contiguous ``[t0, t0+length)`` read, edge-padded when it overruns the episode."""
+        hi = min(t0 + length, num_steps)
+        arr = np.asarray(dset[t0:hi])
+        missing = length - (hi - t0)
+        if missing > 0:
+            arr = np.concatenate([arr, np.repeat(arr[-1:], missing, axis=0)], axis=0)
+        return arr
+
+    def _read_view(self, obs: h5py.Group, cam: str, t0: int, length: int, num_steps: int) -> np.ndarray:
+        """One camera's window -> ``(length, H, W, 3)`` uint8 (JPEG shards decoded)."""
+        if cam in obs:
+            return self._read_span(obs[cam], t0, length, num_steps)
+        jpeg_key = f"{cam}{_JPEG_SUFFIX}"
+        if jpeg_key in obs:
+            return _decode_jpeg_rows(self._read_span(obs[jpeg_key], t0, length, num_steps))
+        raise KeyError(f"Camera {cam!r} (nor {jpeg_key!r}) present in {list(obs.keys())}.")
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        mode = self._choose_mode()
+        ep, t0 = self._locate(int(idx))
+        grp = _open_h5(ep.path)["data"][ep.demo]
+        obs = grp["obs"]
+        window = self._chunk_length + 1
+
+        views = [self._read_view(obs, cam, t0, window, ep.num_steps) for cam in self._cameras]
+        video_thwc = np.concatenate(views, axis=1) if len(views) > 1 else views[0]  # (T, H*ncam, W, 3)
+        video = torch.from_numpy(np.ascontiguousarray(video_thwc)).permute(3, 0, 1, 2)  # (C, T, H, W) uint8
+
+        action = torch.from_numpy(
+            self._read_span(grp["actions"], t0, self._chunk_length, ep.num_steps)[:, :_ACTION_DIM].astype(np.float32)
+        )
+        if self._action_normalization is not None:
+            action = normalize_action(action, self._action_normalization, self._load_norm_stats())
+        if self._use_state:
+            state = self._read_state(obs, t0)
+            if self._action_normalization is not None:
+                state = normalize_action(state, self._action_normalization, self._load_state_stats())
+            action = torch.cat([state.unsqueeze(0), action], dim=0)  # (chunk+1, 7)
+
+        return self._build_result(mode=mode, video=video, action=action, ai_caption=CAPTION_PREFIX + ep.task)
+
+    def _read_state(self, obs: h5py.Group, t0: int) -> torch.Tensor:
+        """Absolute proprio at ``t0`` -> ``[ee_pos(3), ee_ori(3), gripper]``.
+
+        Same 7 channels as the action (position / axis-angle rotation / gripper),
+        dropping the duplicated second finger joint — the LIBERO-delta rule.
+        """
+        state = np.empty(_STATE_DIM, dtype=np.float32)
+        state[0:3] = np.asarray(obs["ee_pos"][t0], dtype=np.float32)
+        state[3:6] = np.asarray(obs["ee_ori"][t0], dtype=np.float32)
+        state[6] = float(np.asarray(obs["gripper_states"][t0], dtype=np.float32)[0])
+        return torch.from_numpy(state)
+
+    # ----------------------------------------------------------------- output
+
+    def _build_result(
+        self,
+        *,
+        mode: str,
+        video: torch.Tensor,
+        action: torch.Tensor,
+        ai_caption: str,
+    ) -> dict[str, Any]:
+        idle_frames = compute_idle_frames(
+            action,
+            self._action_spec(),
+            eps_t=5e-3 / self._fps,
+            eps_r=np.deg2rad(1.5) / self._fps,
+            eps_g=1e-2,
+            joint_threshold=5e-3 / self._fps,
+            min_streak=3,
+        )
+        return {
+            "ai_caption": ai_caption,
+            "video": video,  # already (C, T, H, W) uint8
+            "action": action,
+            "conditioning_fps": torch.tensor(self._fps, dtype=torch.long),
+            "mode": mode,
+            "domain_id": torch.tensor(self._domain_id, dtype=torch.long),
+            "viewpoint": self._viewpoint,
+            "idle_frames": torch.tensor(idle_frames, dtype=torch.long),
+        }
+
+    def _load_norm_stats(self) -> dict[str, torch.Tensor]:
+        """Delta-action stats (``"robocasa"`` block of the shared JSON).
+
+        Committed rather than computed in-memory so the eval server denormalizes
+        with the exact min/max the policy was trained on — pass the same file via
+        ``--action-stats-path``.
+        """
+        if self._norm_stats is None:
+            self._norm_stats = {
+                key: torch.from_numpy(value).float()
+                for key, value in load_action_stats(str(self._normalization_path), _ACTION_STATS_KEY).items()
+            }
+        return self._norm_stats
+
+    def _load_state_stats(self) -> dict[str, torch.Tensor]:
+        """Absolute-proprio stats (``"robocasa_state"`` block), used only for the
+        ``use_state`` conditioning row. Separate from the delta-action stats because
+        the absolute kitchen pose range is far outside the delta range. The eval
+        server loads the same block via ``--state-stats-key robocasa_state``."""
+        if self._state_stats is None:
+            self._state_stats = {
+                key: torch.from_numpy(value).float()
+                for key, value in load_action_stats(str(self._normalization_path), _STATE_STATS_KEY).items()
+            }
+        return self._state_stats

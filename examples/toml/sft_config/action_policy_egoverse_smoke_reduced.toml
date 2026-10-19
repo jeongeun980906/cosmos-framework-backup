@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# REDUCED smoke: same as action_policy_egoverse_smoke.toml but drops "moe_gen"
+# from the trained params so the optimizer state fits on 2 GPUs (validates the
+# full training LOOP — fwd+bwd+optimizer.step+iter — completes; not a real run).
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_egoverse_nano"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_egoverse_smoke_reduced"
+wandb_mode   = "disabled"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 2
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+# Drop "moe_gen" → train only the small generation/action heads so the FusedAdam
+# moment buffers (8 bytes/param, fp32) fit on 2 GPUs.
+keys_to_select = ["time_embedder", "vae2llm", "llm2vae", "action2llm", "llm2action", "action_modality_embed"]
+
+[dataloader_train]
+max_samples_per_batch = 2
+
+[scheduler]
+cycle_lengths = [10]
+
+[trainer]
+max_iter     = 10
+logging_iter = 1
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 10

@@ -1,0 +1,94 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# RoboCasa 24-task action-policy SFT on Cosmos3-Edge — the "dom3" arm.
+#
+# Identical to action_policy_robocasa_edge_frommid.toml (the "mid" arm) in every
+# respect, INCLUDING the EgoVerse warm start. The single difference lives in the
+# registered experiment: the dataset is built with domain_name="hand_pose", so the
+# action heads index DomainAwareLinear row 3 instead of row 5.
+#
+# Why: action2llm/llm2action are nn.Embedding tables of per-domain weight matrices,
+# so a run only trains the rows it indexes. Auditing the checkpoints showed that
+# domain 5 (libero/robocasa) is UNTRAINED in the public Cosmos3-Edge base —
+# llm2action.bias[5] is exactly 0.00000 (nn.init.zeros_ untouched) and fc[5] sits in
+# the same 0.01210-0.01217 band as the 18 never-indexed slots. EgoVerse trained
+# domain 3. So base/mid/midhr/midbb all start RoboCasa from an untrained head, and
+# this is the only arm that starts from one somebody actually trained.
+#
+# The trade is explicit. EgoVerse's 57D layout is head9|Labs9|Lhand15|Rabs9|Rhand15
+# with abs9=[pos(3),R0(3),R1(3)], so row 3's channels 0-6 are HEAD POSE, not our
+# delta-EE + gripper — ch6 in particular is a rotation-matrix element against our
+# gripper, the channel that decides task success. Its output is also 4.03x larger
+# (std 1.948 vs 0.484 pushing h~N(0,1) through the two rows).
+#
+# Measured 10-iter local (2 GPU, same seed/data order as the other arms):
+#   action loss 0.9046 vs base 1.1514 (-21%), vision 0.1943 == mid's 0.1938.
+# So the domain switch touches only the action path, and despite the semantic
+# mismatch it starts LOWER, not higher. Caveat: over those 10 iters it climbs
+# 0.763 -> 1.037 while base/mid sit at +-0.03, so this may be a transient advantage.
+# Judge on final success rate.
+#
+# *** EVAL MUST USE DOMAIN_NAME=hand_pose ***
+# The eval client defaults to "robocasa" -> domain 5, which this run never trains.
+# Querying that row returns garbage rather than erroring.
+#
+# Env required:
+#   ROBOCASA_ROOT=/mnt/ddn/dataset/RoboCasa-Cosmos-Policy/success_only
+#   EGOVERSE_EDGE_LOAD_PATH=<EgoVerse Edge mid DCP iter dir>   # v10 ICL 8K:
+#     /mnt/ddn/tmp/egoverse_v10_icl_edge_4node/cosmos3_action/action_sft/\
+#       action_policy_egoverse_v10_icl_edge/checkpoints/iter_000008000
+#   WAN_VAE_PATH=/mnt/ddn/ckpt/wan2.2/Wan2.2_VAE.pth
+#   IMAGINAIRE_OUTPUT_ROOT=/path/to/output_root
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_robocasa_edge_frommid_domain3"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_robocasa_edge_frommid_domain3"
+wandb_mode   = "online"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+# Set for the shipped 3-node jobs: HSDP shards the model 8-way inside a node over
+# NVLink and replicates 3-way across nodes -> 24 ranks, global batch
+# max_samples_per_batch(16) x 24 = 384. For a single node set replicate = 1
+# (global batch 128). dp_shard * dp_replicate MUST equal world_size.
+#
+# These MUST live here, not on the CLI: `[model]` is a structured node, so a
+# trailing `-- model.parallelism.data_parallel_replicate_degree=3` dies with
+# `ConfigKeyError: Key 'parallelism' is not in struct` at rank 0 and takes the whole
+# job down at rendezvous. (`trainer.*` / `dataloader_train.*` overrides DO work.)
+#
+# Measured: 5.0 s/iter at 16 samples/rank -> ~28 h for the 20K iters below.
+# (25/rank also fits — 7.9 s/iter, 43.1 GB — and at 3 nodes would match the
+# Cosmos-Policy arm exactly on iters, global batch and epochs; ~44 h.)
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 3
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+# Same invariant as the base arm: cycle_lengths INCLUDES warm_up_steps and MUST
+# equal trainer.max_iter. cycle < max_iter kills the run with a TypeError at the
+# very end; cycle > max_iter stops it at a still-high LR.
+cycle_lengths = [20000]
+warm_up_steps = [500]
+
+[trainer]
+max_iter     = 20000
+logging_iter = 50
+
+[checkpoint]
+load_path = "${oc.env:EGOVERSE_EDGE_LOAD_PATH}"
+save_iter = 5000

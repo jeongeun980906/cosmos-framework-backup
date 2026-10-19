@@ -1,0 +1,98 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# RoboCasa 24-task action-policy SFT on Cosmos3-Edge — the "dom3-rescaled" arm.
+#
+# Same as action_policy_robocasa_edge_frommid_domain3.toml (domain 3 head, full
+# EgoVerse warm start) but loading a checkpoint whose domain-3 head rows have been
+# rescaled to domain 5's magnitude.
+#
+# WHY. dom3 starts better and then falls behind, and the cause is scale, not
+# semantics. Measured:
+#   * action loss at 10 iters: 0.9046 vs base 1.1514 (-21%) — the trained head IS a
+#     better start.
+#   * pre-clip global grad norm: 89.0 vs base 16.8, 4.1-6.9x on every one of 10
+#     logged steps — because row 3's output is 4.03x larger (std 1.948 vs 0.484).
+#   * grad_clip.clip_norm = 1.0 is applied as ONE global scalar across every
+#     parameter (callbacks/grad_clip.py: "every mesh group is rescaled with that
+#     single global scalar"), so that inflation renormalises the whole step budget.
+#   * on the cluster (3 nodes, gbs 384) dom3 closed to +1.3% vs base by iter
+#     900-1200, then widened back to +2.7% at 1200-1500 instead of converging.
+#
+# THE FIX. tools/rescale_domain_head_dcp.py multiplies row 3's used slices so their
+# RMS matches row 5's — action2llm rows 0..6 x0.5691, llm2action cols 0..6 and its
+# output bias x0.2490 (net and net_ema alike). Verified after the edit:
+#   output std 1.943 -> 0.483   (domain 5 is 0.485)
+#   direction cosine similarity 1.0000  — the learned channel structure is intact
+#   domains 0/5/8 and the backbone: max delta 0.00e+00 — nothing else moved
+#
+# Build the checkpoint before launching:
+#   python tools/rescale_domain_head_dcp.py \
+#     --src <EgoVerse 8K>/model --out /mnt/ddn/ckpt/c3edge_egoverse8k_dom3scaled/model \
+#     --domain 3 --target-domain 5 --raw-action-dim 7
+#
+# *** EVAL MUST USE DOMAIN_NAME=hand_pose *** — the rescale changes magnitudes, not
+# which DomainAwareLinear row is indexed. The default (robocasa -> row 5) reads a row
+# this run never trains and returns garbage without erroring.
+#
+# NOTE the load_path below: a TOML [checkpoint] load_path OVERRIDES whatever the
+# registered experiment sets, so it must name the rescaled env var. Pointing it at
+# EGOVERSE_EDGE_LOAD_PATH would silently train the UNSCALED arm.
+#
+# Env required:
+#   ROBOCASA_ROOT=/mnt/ddn/dataset/RoboCasa-Cosmos-Policy/success_only
+#   EGOVERSE_DOM3SCALED_LOAD_PATH=/mnt/ddn/ckpt/c3edge_egoverse8k_dom3scaled
+#   WAN_VAE_PATH=/mnt/ddn/ckpt/wan2.2/Wan2.2_VAE.pth
+#   IMAGINAIRE_OUTPUT_ROOT=/path/to/output_root
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_robocasa_edge_frommid_domain3_rescaled"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_robocasa_edge_frommid_domain3_rescaled"
+wandb_mode   = "online"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+# Set for the shipped 3-node jobs: HSDP shards the model 8-way inside a node over
+# NVLink and replicates 3-way across nodes -> 24 ranks, global batch
+# max_samples_per_batch(16) x 24 = 384. For a single node set replicate = 1
+# (global batch 128). dp_shard * dp_replicate MUST equal world_size.
+#
+# These MUST live here, not on the CLI: `[model]` is a structured node, so a
+# trailing `-- model.parallelism.data_parallel_replicate_degree=3` dies with
+# `ConfigKeyError: Key 'parallelism' is not in struct` at rank 0 and takes the whole
+# job down at rendezvous. (`trainer.*` / `dataloader_train.*` overrides DO work.)
+#
+# Measured: 5.0 s/iter at 16 samples/rank -> ~28 h for the 20K iters below.
+# (25/rank also fits — 7.9 s/iter, 43.1 GB — and at 3 nodes would match the
+# Cosmos-Policy arm exactly on iters, global batch and epochs; ~44 h.)
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 3
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+# Same invariant as the base arm: cycle_lengths INCLUDES warm_up_steps and MUST
+# equal trainer.max_iter. cycle < max_iter kills the run with a TypeError at the
+# very end; cycle > max_iter stops it at a still-high LR.
+cycle_lengths = [20000]
+warm_up_steps = [500]
+
+[trainer]
+max_iter     = 20000
+logging_iter = 50
+
+[checkpoint]
+load_path = "${oc.env:EGOVERSE_DOM3SCALED_LOAD_PATH}"
+save_iter = 5000

@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# 2-GPU SMOKE for the GR1 v6 Edge BC arm: validates the full loop (Edge
+# backbone + v6 pairs + use_state + 3-cam concat_view + plain query-only).
+# Drops moe_gen from the optimizer so state fits on 2 GPUs.
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_gr1_v6_bc_edge"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_gr1_v6_bc_edge_smoke"
+wandb_mode   = "disabled"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 2
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+keys_to_select = ["time_embedder", "vae2llm", "llm2vae", "action2llm", "llm2action", "action_modality_embed"]
+
+[dataloader_train]
+max_samples_per_batch = 2
+
+[scheduler]
+cycle_lengths = [3]
+warm_up_steps = [0]
+
+[trainer]
+max_iter     = 3
+logging_iter = 1
+
+[checkpoint]
+load_path = "${oc.env:EDGE_LOAD_PATH}"
+save_iter = 100

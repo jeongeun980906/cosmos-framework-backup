@@ -1,0 +1,76 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# RoboCasa 24-task action-policy SFT on Cosmos3-Edge — run config for the
+# registered `action_policy_aloha_edge` experiment. Recipe knobs (optimizer/lr,
+# 3-cam concat, use_state proprio row, min-max stats, count-based batch) live in
+# the experiment; this file only sets run-level scalars.
+#
+# Env required:
+#   ALOHA_ROOT=/mnt/ddn/dataset/tabletop-simulation-hdf5
+#   EDGE_LOAD_PATH=/mnt/ddn/ckpt/cosmos3_edge_dcp        # DCP PARENT dir (the
+#                                                        # loader appends /model)
+#   WAN_VAE_PATH=/mnt/ddn/ckpt/wan2.2/Wan2.2_VAE.pth
+#   IMAGINAIRE_OUTPUT_ROOT=/path/to/output_root           # persist checkpoints
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_aloha_edge"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_aloha_edge"
+wandb_mode   = "online"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+# Set for the shipped 3-node jobs: HSDP shards the model 8-way inside a node over
+# NVLink and replicates 3-way across nodes -> 24 ranks, global batch
+# max_samples_per_batch(16) x 24 = 384. For a single node set replicate = 1
+# (global batch 128). dp_shard * dp_replicate MUST equal world_size.
+#
+# These MUST live here, not on the CLI: `[model]` is a structured node, so a
+# trailing `-- model.parallelism.data_parallel_replicate_degree=3` dies with
+# `ConfigKeyError: Key 'parallelism' is not in struct` at rank 0 and takes the whole
+# job down at rendezvous. (`trainer.*` / `dataloader_train.*` overrides DO work.)
+#
+# Measured: 5.0 s/iter at 16 samples/rank -> ~28 h for the 20K iters below.
+# (25/rank also fits — 7.9 s/iter, 43.1 GB — and at 3 nodes would match the
+# Cosmos-Policy arm exactly on iters, global batch and epochs; ~44 h.)
+data_parallel_shard_degree     = 2
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+# cycle_lengths INCLUDES warm_up_steps: the multiplier ramps 0 -> 1 over the first
+# 500 steps, then decays LINEARLY to f_min=0 at exactly step 20000 (verified against
+# LambdaLinearScheduler.schedule). It never bottoms out mid-run.
+#
+# KEEP cycle_lengths == trainer.max_iter. Two failure modes if they drift apart:
+#   cycle < max_iter -> LambdaLinearScheduler.find_in_interval returns None past the
+#                       cycle end and training dies with a TypeError AT THE END of the
+#                       run (not a silent LR floor).
+#   cycle > max_iter -> the run stops before the decay finishes, at a still-high LR
+#                       (e.g. cycle 40000 / max_iter 20000 ends at ~0.5 x peak).
+cycle_lengths = [6]
+warm_up_steps = [2]
+
+[trainer]
+max_iter     = 6
+logging_iter = 1
+
+[checkpoint]
+load_path = "${oc.env:EDGE_LOAD_PATH}"
+# 5000 -> checkpoints at 5K/10K/15K/20K, ~30 GB each = ~120 GB (1000 would be ~600 GB).
+# Trade-off: auto-resume restarts from the last saved iter, so a crash can cost up to
+# 5000 iters (~7 h at the measured 5.0 s/iter).
+save_iter = 1000000

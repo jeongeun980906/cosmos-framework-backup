@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# GR1 v6 post-training on Cosmos3-EDGE — ICL arm of the ICL-vs-BC pair.
+# Data = egoverse_pairs_gr1_v6 (stride-1 per-frame queries, K=6 demos). Both arms
+# share every knob; only the demo conditioning differs (BC = plain query-only).
+# EDGE_LOAD_PATH must point at a Cosmos3-Edge DCP dir (converted via
+# convert_model_to_dcp from nvidia/Cosmos3-Edge).
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_gr1_v6_icl_edge"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_gr1_v6_icl_edge"
+wandb_mode   = "online"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 3
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[scheduler]
+cycle_lengths = [8000]
+warm_up_steps = [500]
+
+[trainer]
+max_iter     = 8000
+logging_iter = 50
+
+[checkpoint]
+load_path = "${oc.env:EDGE_LOAD_PATH}"
+save_iter = 1000

@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# ============================================================================
+# SMOKE config for `action_policy_egoverse_nano` — 10 iters, 2-way FSDP shard,
+# wandb off. For config/data/checkpoint + multi-domain/shared-grid packing
+# sanity, NOT a real run.
+#
+# Env required:
+#   EGOVERSE_DATA_ROOT (parent of egoverse/ + egoverse_eva/, default /mnt/ddn/dataset)
+#   EGOVERSE_PAIRS_DIR (default /mnt/ddn/dataset/egoverse_pairs_v7)
+#   BASE_CHECKPOINT_PATH, WAN_VAE_PATH, IMAGINAIRE_OUTPUT_ROOT
+# Launch: torchrun --nproc_per_node=2 -m cosmos_framework.scripts.train \
+#             --sft-toml examples/toml/sft_config/action_policy_egoverse_smoke.toml
+# ============================================================================
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_egoverse_nano"
+project      = "cosmos3_action"
+group        = "action_sft"
+name         = "action_policy_egoverse_smoke"
+wandb_mode   = "disabled"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 2    # 2-way FSDP shard (Nano 8B doesn't fit on 1 GPU)
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[dataloader_train]
+max_samples_per_batch = 2   # tiny for the 2-GPU smoke (paired = 2 videos/sample)
+
+[scheduler]
+cycle_lengths = [10]   # match max_iter
+
+[trainer]
+max_iter     = 10
+logging_iter = 1
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 10
