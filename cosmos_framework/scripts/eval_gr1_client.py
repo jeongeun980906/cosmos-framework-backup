@@ -56,7 +56,7 @@ from PIL import Image
 from robocasa.utils.mimicdroid_utils import EnvArgs, make_env, reset_to
 
 CHUNK = 32
-TASKDEMOS = "/mnt/ddn/dataset/MimicDroidDataset/TaskDemos"
+TASKDEMOS = os.environ.get("MIMICDROID_TASKDEMOS", "/mnt/ddn/dataset/MimicDroidDataset/TaskDemos")
 CAMS = ("center", "sideleft", "sideright", "center_top")   # order = server grid TL,TR,BL,BR; old 3-view servers slice to the first 3 (grid4 servers use all 4; 2026-07-16)
 
 # GR1 v2 training data grip convention (VERIFIED on egoverse zarr state57, all 4 tasks,
